@@ -3,8 +3,9 @@
 """
 上市公司重要提醒 → Outlook 日历订阅（ICS）
 
-数据源：东方财富「股市日历」（datacenter-web.eastmoney.com），免费免鉴权公开接口。
-覆盖事件：预约披露日（年报/中报/季报）、业绩预告、业绩快报、业绩报表、股东大会、分红、限售解禁日。
+数据源：东方财富「股市日历」+ 港股公告（免费免鉴权公开接口）。
+A 股事件：预约披露日（年报/中报/季报）、业绩预告、业绩快报、业绩报表、股东大会、分红、限售解禁日。
+港股事件：业绩公布、董事会会议、股东大会、股息、盈喜盈警（尽量从公告正文提取会议日/除净日等真实日期）。
 
 用法：
     python listed_company_calendar.py              # 只生成 ICS 文件
@@ -15,6 +16,7 @@
 import argparse
 import hashlib
 import json
+import re
 import sys
 import threading
 import time
@@ -38,7 +40,29 @@ CATEGORY_MAP = {
     "股东大会": "股东大会",
     "分红": "分红",
     "限售解禁日": "解禁",
+    "业绩公布": "财报",
+    "董事会会议": "会议",
+    "股息": "分红",
+    "盈喜盈警": "业绩",
 }
+
+HK_ANNOUNCE_API = "https://np-anotice-stock.eastmoney.com/api/security/ann"
+HK_CONTENT_API = "https://np-cnotice-stock.eastmoney.com/api/content/ann"
+HK_DAYS_BACK = 90  # 只翻最近 90 天的港股公告，够覆盖股东会/派息等未来事件
+
+HK_CATEGORY_KEYWORDS = {
+    "业绩公布": ["业绩公布", "业绩报告", "中期报告", "年度报告", "全年业绩", "中期业绩", "季度业绩", "業績公佈", "業績報告", "年度業績", "中期業績"],
+    "董事会会议": ["董事会会议", "董事會會議"],
+    "股东大会": ["股东大会", "股东周年大会", "股东特别大会", "股東大會", "股東週年大會", "股東特別大會"],
+    "股息": ["股息", "派息", "末期息", "中期息", "特别股息", "特別股息", "分派"],
+    "盈喜盈警": ["盈喜", "盈警", "盈利警告", "盈利预喜", "盈利預喜", "业绩预告"],
+}
+HK_EXCLUDE_TITLES = ["翌日披露报表", "月报表", "回购", "股份购回", "证券变动"]
+
+CN_DIGITS = {"零": 0, "〇": 0, "一": 1, "二": 2, "兩": 2, "两": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+CN_UNITS = {"十": 10, "百": 100, "千": 1000, "万": 10000, "萬": 10000}
+DATE_RE_ARABIC = re.compile(r"(20\d{2})\s*[年./\-]\s*(\d{1,2})\s*[月./\-]\s*(\d{1,2})\s*日?")
+DATE_RE_CHINESE = re.compile(r"([一二三四五六七八九零〇两兩0-9]{4})\s*年\s*([一二三四五六七八九十两兩]{1,3})\s*月\s*([一二三四五六七八九十两兩]{1,4})\s*日?")
 
 SERVE_STATE = {
     "bytes": b"",
@@ -67,10 +91,19 @@ def http_get_json(url: str) -> dict:
 
 def get_secid(code: str) -> str:
     """把 6 位股票代码转成东财行情接口的 secid（沪市 1.，深市/北交所 0.）。"""
-    code = code.strip().zfill(6)
+    code = code.strip()
+    if code.upper().endswith(".HK") or code.upper().startswith("HK"):
+        return f"116.{normalize_hk_code(code)}"
+    code = code.zfill(6)
     if code.startswith(("6", "9")):
         return f"1.{code}"
     return f"0.{code}"
+
+
+def normalize_hk_code(code: str) -> str:
+    """把港股代码规范成东财用的 5 位数字，如 700 / 0700.HK / HK00700 → 00700。"""
+    digits = re.sub(r"[^0-9]", "", code)
+    return digits.zfill(5)
 
 
 def fetch_stock_name(code: str) -> str:
@@ -153,6 +186,188 @@ def fetch_stock_events(code: str, event_types: list[str], days_ahead: int) -> tu
     return unique, failed_count
 
 
+def parse_cn_int(text: str) -> int | None:
+    """把中文数字转成整数：二零二六→2026，十二→12，一百二十三→123。"""
+    text = text.strip()
+    if not text:
+        return None
+    if all(ch in CN_DIGITS for ch in text):
+        return int("".join(str(CN_DIGITS[ch]) for ch in text))
+    total = 0
+    section = 0
+    num = 0
+    for ch in text:
+        if ch in CN_DIGITS:
+            num = CN_DIGITS[ch]
+        elif ch in ("十", "百", "千"):
+            if num == 0:
+                num = 1
+            section += num * CN_UNITS[ch]
+            num = 0
+        elif ch in ("万", "萬"):
+            section = (section + num) * 10000
+            total += section
+            section = 0
+            num = 0
+        else:
+            return None
+    return total + section + num
+
+
+def extract_dates(text: str) -> list[date]:
+    """从文本中提取所有日期（支持 2026年8月12日 和 二零二六年八月十二日 两种写法）。"""
+    found = []
+    for m in DATE_RE_ARABIC.finditer(text):
+        try:
+            found.append(date(int(m.group(1)), int(m.group(2)), int(m.group(3))))
+        except ValueError:
+            pass
+    for m in DATE_RE_CHINESE.finditer(text):
+        year = parse_cn_int(m.group(1))
+        month = parse_cn_int(m.group(2))
+        day = parse_cn_int(m.group(3))
+        if year and month and day:
+            try:
+                found.append(date(year, month, day))
+            except ValueError:
+                pass
+    return found
+
+
+def match_hk_category(title: str) -> str | None:
+    for category, keywords in HK_CATEGORY_KEYWORDS.items():
+        if any(kw in title for kw in keywords):
+            return category
+    return None
+
+
+def fetch_hk_announcement_content(art_code: str) -> tuple[str, str]:
+    url = f"{HK_CONTENT_API}?art_code={art_code}&client_source=web&page_index=1"
+    try:
+        payload = http_get_json(url)
+    except Exception:
+        return "", ""
+    data = payload.get("data") or {}
+    return str(data.get("notice_content") or ""), str(data.get("attach_url") or "")
+
+
+def pick_hk_event_date(category: str, title: str, content: str, notice: date, today: date, max_date: date) -> date:
+    """尽量从公告标题/正文里找真正的未来事件日期（会议日、除净日等），找不到就用发布日。"""
+    if category in ("业绩公布", "盈喜盈警"):
+        return notice
+    if category == "股息":
+        for kw in ("除净日", "除淨日", "除息日", "股权登记日", "股權登記日", "記錄日期", "记录日期"):
+            idx = content.find(kw)
+            if idx >= 0:
+                segment = content[idx : idx + 80]
+                future = [d for d in extract_dates(segment) if today <= d <= max_date]
+                if future:
+                    return min(future)
+    for text in (title, content):
+        future = [d for d in extract_dates(text) if today <= d <= max_date]
+        if future:
+            return min(future)
+    return notice
+
+
+def fetch_hk_events(code: str, days_ahead: int) -> tuple[list[dict], int]:
+    """抓取港股公告，按标题分类成业绩公布/董事会会议/股东大会/股息/盈喜盈警。"""
+    hk_code = normalize_hk_code(code)
+    today = date.today()
+    max_date = today + timedelta(days=days_ahead)
+    cutoff = today - timedelta(days=HK_DAYS_BACK)
+    events = []
+    failed = 0
+    page = 1
+
+    try:
+        while True:
+            params = {
+                "sr": "-1",
+                "page_size": "100",
+                "page_index": str(page),
+                "ann_type": "H",
+                "client_source": "web",
+                "stock_list": hk_code,
+            }
+            url = HK_ANNOUNCE_API + "?" + urllib.parse.urlencode(params)
+            try:
+                payload = http_get_json(url)
+            except Exception as exc:
+                log(f"  警告：{code} 港股公告获取失败：{exc}")
+                failed += 1
+                break
+
+            rows = (payload.get("data") or {}).get("list") or []
+            if not rows:
+                break
+
+            reached_cutoff = False
+            for row in rows:
+                try:
+                    notice = datetime.strptime(str(row.get("notice_date") or "")[:10], "%Y-%m-%d").date()
+                except ValueError:
+                    continue
+                if notice < cutoff:
+                    reached_cutoff = True
+                    break
+                if notice > today:
+                    continue
+
+                title = str(row.get("title_ch") or row.get("title") or "").strip()
+                if not title or any(kw in title for kw in HK_EXCLUDE_TITLES):
+                    continue
+                category = match_hk_category(title)
+                if not category:
+                    continue
+
+                content = ""
+                attach_url = ""
+                if category in ("董事会会议", "股东大会", "股息"):
+                    content, attach_url = fetch_hk_announcement_content(row.get("art_code") or "")
+                    time.sleep(0.15)
+
+                event_date = pick_hk_event_date(category, title, content, notice, today, max_date)
+                if not (today <= event_date <= max_date):
+                    continue
+
+                detail = title
+                if event_date != notice:
+                    detail += f"\n事件日期：{event_date.isoformat()}（公告发布日：{notice.isoformat()}）"
+                else:
+                    detail += f"\n事件日期：{event_date.isoformat()}"
+                if attach_url:
+                    detail += f"\n公告链接：{attach_url}"
+                detail += "\n数据来源：东方财富港股公告"
+
+                events.append(
+                    {
+                        "stock_code": code,
+                        "event_type": category,
+                        "date": event_date,
+                        "content": title,
+                        "detail": detail,
+                    }
+                )
+
+            total = int((payload.get("data") or {}).get("total_hits") or 0)
+            if reached_cutoff or len(rows) < 100 or page * 100 >= total:
+                break
+            page += 1
+    except Exception as exc:
+        log(f"  警告：{code} 港股抓取异常：{exc}")
+        failed += 1
+
+    # 去重：同一只股票同一类事件同一天只保留一条
+    seen, unique = set(), []
+    for ev in events:
+        key = (ev["stock_code"], ev["event_type"], ev["date"])
+        if key not in seen:
+            seen.add(key)
+            unique.append(ev)
+    return unique, failed
+
+
 def load_all_events(config: dict) -> list[dict]:
     stocks = config.get("stocks") or []
     event_types = config.get("event_types") or ["预约披露日"]
@@ -168,7 +383,10 @@ def load_all_events(config: dict) -> list[dict]:
         name = str(item.get("name") or "").strip() or fetch_stock_name(code)
         log(f"正在获取 {code} {name} …")
         try:
-            events, failed_count = fetch_stock_events(code, event_types, days_ahead)
+            if code.upper().endswith(".HK") or code.upper().startswith("HK"):
+                events, failed_count = fetch_hk_events(code, days_ahead)
+            else:
+                events, failed_count = fetch_stock_events(code, event_types, days_ahead)
         except Exception as exc:
             log(f"  警告：{code} 获取失败：{exc}")
             continue
@@ -178,13 +396,16 @@ def load_all_events(config: dict) -> list[dict]:
             ev["stock_name"] = name
             ev["summary"] = f"{name}：{ev['content']}"
             ev["category"] = CATEGORY_MAP.get(ev["event_type"], "公告")
-            ev["description"] = (
-                f"{name}（{code}）\n"
-                f"{ev['content']}\n"
-                f"事件日期：{ev['date'].isoformat()}\n"
-                f"事件类型：{ev['event_type']}\n"
-                "数据来源：东方财富股市日历（https://data.eastmoney.com/）"
-            )
+            if "detail" in ev:
+                ev["description"] = f"{name}（{code}）\n{ev['detail']}"
+            else:
+                ev["description"] = (
+                    f"{name}（{code}）\n"
+                    f"{ev['content']}\n"
+                    f"事件日期：{ev['date'].isoformat()}\n"
+                    f"事件类型：{ev['event_type']}\n"
+                    "数据来源：东方财富股市日历（https://data.eastmoney.com/）"
+                )
         counts = {}
         for ev in events:
             counts[ev["event_type"]] = counts.get(ev["event_type"], 0) + 1
