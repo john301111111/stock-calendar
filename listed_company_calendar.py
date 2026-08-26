@@ -241,6 +241,11 @@ def match_hk_category(title: str) -> str | None:
     return None
 
 
+def is_temporary_egm(text: str) -> bool:
+    """判断是否临时股东大会（A 股叫临时股东大会，港股叫股东特别大会）。"""
+    return any(kw in text for kw in ("临时股东", "臨時股東", "特别股东", "特別股東"))
+
+
 def fetch_hk_announcement_content(art_code: str) -> tuple[str, str]:
     url = f"{HK_CONTENT_API}?art_code={art_code}&client_source=web&page_index=1"
     try:
@@ -392,7 +397,10 @@ def load_all_events(config: dict) -> list[dict]:
             continue
         attempts += len(event_types)
         failed += failed_count
+        kept = []
         for ev in events:
+            if ev["event_type"] == "股东大会" and is_temporary_egm(ev["content"]):
+                continue
             ev["stock_name"] = name
             ev["summary"] = f"{name}：{ev['content']}"
             ev["category"] = CATEGORY_MAP.get(ev["event_type"], "公告")
@@ -406,6 +414,8 @@ def load_all_events(config: dict) -> list[dict]:
                     f"事件类型：{ev['event_type']}\n"
                     "数据来源：东方财富股市日历（https://data.eastmoney.com/）"
                 )
+            kept.append(ev)
+        events = kept
         counts = {}
         for ev in events:
             counts[ev["event_type"]] = counts.get(ev["event_type"], 0) + 1
